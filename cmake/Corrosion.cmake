@@ -406,8 +406,6 @@ function(_corrosion_add_library_target)
     endif()
     set("${CALT_OUT_ARCHIVE_OUTPUT_BYPRODUCTS}" "${archive_output_byproducts}" PARENT_SCOPE)
 
-    add_library(${target_name} INTERFACE)
-
     if(has_staticlib)
         add_library(${target_name}-static STATIC IMPORTED GLOBAL)
         add_dependencies(${target_name}-static cargo-build_${target_name})
@@ -421,6 +419,10 @@ function(_corrosion_add_library_target)
             set_property(
                     TARGET ${target_name}-static
                     PROPERTY INTERFACE_LINK_LIBRARIES ${Rust_CARGO_TARGET_LINK_NATIVE_LIBS}
+            )
+            set_property(
+                    TARGET ${target_name}-static
+                    PROPERTY INTERFACE_LINK_OPTIONS ${Rust_CARGO_TARGET_LINK_OPTIONS}
             )
             if(is_macos)
                 set_property(TARGET ${target_name}-static
@@ -487,11 +489,6 @@ function(_corrosion_add_bin_target workspace_manifest_path bin_name out_bin_bypr
     # target property
     set(bin_filename "${bin_name}")
     set(${out_bin_byproduct} "${bin_filename}" PARENT_SCOPE)
-
-
-    # Todo: This is compatible with the way corrosion previously exposed the bin name,
-    # but maybe we want to prefix the exposed name with the package name?
-    add_executable(${bin_name} IMPORTED GLOBAL)
     add_dependencies(${bin_name} cargo-build_${bin_name})
 
     if(Rust_CARGO_TARGET_OS STREQUAL "darwin")
@@ -573,6 +570,7 @@ function(_add_cargo_build out_cargo_build_out_dir)
     set(path_to_toml "${ACB_MANIFEST_PATH}")
     set(target_kinds "${ACB_TARGET_KINDS}")
     set(workspace_manifest_path "${ACB_WORKSPACE_MANIFEST_PATH}")
+    set(build_byproducts "${ACB_BYPRODUCTS}")
 
 
     if(NOT target_kinds)
@@ -749,7 +747,7 @@ function(_add_cargo_build out_cargo_build_out_dir)
         corrosion_add_target_local_rustflags("${target_name}" "$<$<NOT:${explicit_linker_defined}>:${rustflag_linker_arg}>")
     endif()
 
-    message(DEBUG "TARGET ${target_name} produces byproducts ${byproducts}")
+    message(DEBUG "TARGET ${target_name} produces byproducts ${build_byproducts}")
 
     add_custom_target(
         _cargo-build_${target_name}
@@ -780,12 +778,11 @@ function(_add_cargo_build out_cargo_build_out_dir)
                 ${local_rustflags_delimiter}
                 ${local_rustflags_genex}
 
-        # Note: Adding `build_byproducts` (the byproducts in the cargo target directory) here
-        # causes CMake to fail during the Generate stage, because the target `target_name` was not
-        # found. I don't know why this happens, so we just don't specify byproducts here and
-        # only specify the actual byproducts in the `POST_BUILD` custom command that copies the
-        # byproducts to the final destination.
-        # BYPRODUCTS  ${build_byproducts}
+        # Note: `BYPRODUCTS` may not contain **target specific** generator expressions.
+        # This means we cannot use `${cargo_build_dir}`, since it currently uses `$<TARGET_PROPERTY>`
+        # to determine the correct target directory, depending on if the hostbuild target property is
+        # set or not.
+        # BYPRODUCTS  "${cargo_build_dir}/${build_byproducts}"
         # The build is conducted in the directory of the Manifest, so that configuration files such as
         # `.cargo/config.toml` or `toolchain.toml` are applied as expected.
         WORKING_DIRECTORY "${workspace_toml_dir}"
@@ -1071,11 +1068,15 @@ function(corrosion_set_features target_name)
 endfunction()
 
 function(corrosion_link_libraries target_name)
-    if(TARGET "${target_name}-static" AND NOT TARGET "${target_name}-shared")
-        message(WARNING "The target ${target_name} builds a static library."
-            "The linker is never invoked for a static libraries to link has effect "
-            " aside from establishing a build dependency."
-            )
+    if(TARGET "${target_name}-static")
+        message(DEBUG "The target ${target_name} builds a static Rust library."
+                "Calling `target_link_libraries()` instead."
+        )
+        target_link_libraries("${target_name}-static" INTERFACE ${ARGN})
+        if(NOT TARGET "${target_name}-shared")
+            # Early return, since Rust won't invoke the linker for static libraries
+            return()
+        endif()
     endif()
     add_dependencies(_cargo-build_${target_name} ${ARGN})
     foreach(library ${ARGN})
@@ -1089,7 +1090,7 @@ function(corrosion_link_libraries target_name)
         corrosion_add_target_local_rustflags(${target_name} "-L$<TARGET_LINKER_FILE_DIR:${library}>")
         corrosion_add_target_local_rustflags(${target_name} "-l$<TARGET_LINKER_FILE_BASE_NAME:${library}>")
     endforeach()
-endfunction(corrosion_link_libraries)
+endfunction()
 
 function(corrosion_install)
     # Default install dirs
@@ -1490,8 +1491,8 @@ ANCHOR: corrosion_cbindgen
 ```cmake
 corrosion_cbindgen(
         TARGET <imported_target_name>
-        CARGO_PACKAGE <cargo_package_name>
         HEADER_NAME <output_header_name>
+        [CARGO_PACKAGE <cargo_package_name>]
         [MANIFEST_DIRECTORY <package_manifest_directory>]
         [CBINDGEN_VERSION <version>]
         [FLAGS <flag1> ... <flagN>]
@@ -1507,10 +1508,6 @@ between multiple invocations of this function.
 * **TARGET**: The name of an imported Rust library target, for which bindings should be generated.
               If the target was not previously imported by Corrosion, because the crate only produces an
               `rlib`, you must additionally specify `MANIFEST_DIRECTORY`.
-
-* **CARGO_PACKAGE**: The name of the Rust cargo package that contains the library target. Note, that `cbindgen`
-                     expects this package name using the `--crate` parameter. If not specified, the **TARGET**
-                     will be used instead.
 
 * **MANIFEST_DIRECTORY**: Directory of the package defining the library crate bindings should be generated for.
     If you want to avoid specifying `MANIFEST_DIRECTORY` you could add a `staticlib` target to your package
@@ -1535,10 +1532,12 @@ between multiple invocations of this function.
 ANCHOR_END: corrosion_cbindgen
 #]=======================================================================]
 function(corrosion_experimental_cbindgen)
-    # Todo:
-    # - set the target-triple via the TARGET env variable based on the target triple for the rust crate.
     set(OPTIONS "")
-    set(ONE_VALUE_KEYWORDS TARGET CARGO_PACKAGE MANIFEST_DIRECTORY HEADER_NAME CBINDGEN_VERSION)
+    set(ONE_VALUE_KEYWORDS
+            TARGET
+            MANIFEST_DIRECTORY
+            HEADER_NAME
+            CBINDGEN_VERSION)
     set(MULTI_VALUE_KEYWORDS "FLAGS")
     cmake_parse_arguments(PARSE_ARGV 0 CCN "${OPTIONS}" "${ONE_VALUE_KEYWORDS}" "${MULTI_VALUE_KEYWORDS}")
 
@@ -1552,6 +1551,10 @@ function(corrosion_experimental_cbindgen)
     endforeach()
     set(rust_target "${CCN_TARGET}")
     unset(package_manifest_dir)
+
+
+    set(hostbuild_override "$<BOOL:$<TARGET_PROPERTY:${rust_target},${_CORR_PROP_HOST_BUILD}>>")
+    set(cbindgen_target_triple "$<IF:${hostbuild_override},${_CORROSION_RUST_CARGO_HOST_TARGET},${_CORROSION_RUST_CARGO_TARGET}>")
 
     if(TARGET "${rust_target}")
         get_target_property(package_manifest_path "${rust_target}" INTERFACE_COR_PACKAGE_MANIFEST_PATH)
@@ -1570,14 +1573,13 @@ function(corrosion_experimental_cbindgen)
         endif()
     endif()
 
-    unset(rust_cargo_package)
-    if(NOT DEFINED CCN_CARGO_PACKAGE)
-        message(STATUS "Using rust_target ${rust_target} as crate for cbindgen")
-        set(rust_cargo_package "${rust_target}")
-    else()
-        message(STATUS "Using crate ${CCN_CARGO_PACKAGE} as crate for cbindgen")
-        set(rust_cargo_package "${CCN_CARGO_PACKAGE}")
+    get_target_property(rust_cargo_package "${rust_target}" COR_CARGO_PACKAGE_NAME )
+    if(NOT rust_cargo_package)
+        message(FATAL_ERROR "Internal Error: Could not determine cargo package name for cbindgen. "
+        )
     endif()
+    message(STATUS "Using package ${rust_cargo_package} as crate for cbindgen")
+
 
     set(output_header_name "${CCN_HEADER_NAME}")
 
@@ -1649,7 +1651,9 @@ function(corrosion_experimental_cbindgen)
         OUTPUT
         "${generated_header}"
         COMMAND
-        "${cbindgen}"
+        "${CMAKE_COMMAND}" -E env
+            TARGET="${cbindgen_target_triple}"
+            "${cbindgen}"
                     --output "${generated_header}"
                     --crate "${rust_cargo_package}"
                     ${depfile_cbindgen_arg}
@@ -1668,11 +1672,19 @@ function(corrosion_experimental_cbindgen)
         )
     endif()
 
-    add_custom_target(_corrosion_cbindgen_${rust_target}_bindings
-        DEPENDS "${generated_header}"
-        COMMENT "Generate cbindgen bindings for package ${rust_cargo_package}"
+    if(NOT TARGET "_corrosion_cbindgen_${rust_target}_bindings")
+        add_custom_target(_corrosion_cbindgen_${rust_target}_bindings
+                COMMENT "Generate cbindgen bindings for package ${rust_cargo_package}"
+        )
+    endif()
+    # Users might want to call cbindgen multiple times, e.g. to generate separate C++ and C header files.
+    string(MAKE_C_IDENTIFIER "${output_header_name}" header_identifier )
+    add_custom_target("_corrosion_cbindgen_${rust_target}_bindings_${header_identifier}"
+            DEPENDS "${generated_header}"
+            COMMENT "Generate ${generated_header} for ${rust_target}"
     )
-    add_dependencies(${rust_target} _corrosion_cbindgen_${rust_target}_bindings)
+    add_dependencies("_corrosion_cbindgen_${rust_target}_bindings" "_corrosion_cbindgen_${rust_target}_bindings_${header_identifier}")
+    add_dependencies(${rust_target} "_corrosion_cbindgen_${rust_target}_bindings")
 endfunction()
 
 # Parse the version of a Rust package from it's package manifest (Cargo.toml)
@@ -1720,6 +1732,22 @@ function(corrosion_parse_package_version package_manifest_path out_package_versi
             PARENT_SCOPE
         )
     endif()
+endfunction()
+
+function(_corrosion_initialize_properties target_name)
+    # Initialize the `<XYZ>_OUTPUT_DIRECTORY` properties based on `CMAKE_<XYZ>_OUTPUT_DIRECTORY`.
+    foreach(output_var RUNTIME_OUTPUT_DIRECTORY ARCHIVE_OUTPUT_DIRECTORY LIBRARY_OUTPUT_DIRECTORY PDB_OUTPUT_DIRECTORY)
+        if (DEFINED "CMAKE_${output_var}")
+            set_property(TARGET ${target_name} PROPERTY "${output_var}" "${CMAKE_${output_var}}")
+        endif()
+
+        foreach(config_type ${CMAKE_CONFIGURATION_TYPES})
+            string(TOUPPER "${config_type}" config_type_upper)
+            if (DEFINED "CMAKE_${output_var}_${config_type_upper}")
+                set_property(TARGET ${target_name} PROPERTY "${output_var}_${config_type_upper}" "${CMAKE_${output_var}_${config_type_upper}}")
+            endif()
+        endforeach()
+    endforeach()
 endfunction()
 
 # Helper macro to pass through an optional `OPTION` argument parsed via `cmake_parse_arguments`
